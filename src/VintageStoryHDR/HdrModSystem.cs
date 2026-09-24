@@ -13,7 +13,7 @@ using VintageStoryHDR.Rendering;
 namespace VintageStoryHDR;
 
 /// <summary>
-/// Client-only mod that presents the game in HDR on Windows. See README.md for how the
+/// Client-only mod that presents the game in HDR on Windows, and on Linux under Wayland. See README.md for how the
 /// pipeline fits together and docs/findings.md for the game internals behind it.
 /// </summary>
 public sealed class HdrModSystem : ModSystem
@@ -37,9 +37,11 @@ public sealed class HdrModSystem : ModSystem
         LoadConfig(api);
         RegisterCommand(api);
 
-        if (!OperatingSystem.IsWindows())
+        if (!OperatingSystem.IsWindows() && !WaylandVulkanOutput.GameIsOnWayland())
         {
-            HdrRuntime.InactiveReason = "HDR output goes through DXGI, which only exists on Windows.";
+            HdrRuntime.InactiveReason = OperatingSystem.IsLinux()
+                ? "on Linux, HDR output needs the game running on native Wayland, not X11 or XWayland."
+                : "HDR output is only implemented for Windows and for Linux on Wayland.";
             Mod.Logger.Notification("{0} Vanilla presentation left untouched.", HdrRuntime.InactiveReason);
             return;
         }
@@ -163,7 +165,7 @@ public sealed class HdrModSystem : ModSystem
                 break;
             default:
                 return TextCommandResult.Error(
-                    "Usage: .hdr | .hdr on | .hdr off | .hdr paperwhite <nits> | .hdr ui <nits, 0 = paperwhite> | .hdr peak <nits, 0 = display> | " +
+                    "Usage: .hdr | .hdr on | .hdr off | .hdr paperwhite <nits, 0 = display> | .hdr ui <nits, 0 = paperwhite> | .hdr peak <nits, 0 = display> | " +
                     ".hdr emissive <x> | .hdr highlight <x> | .hdr stars <x> | .hdr gamut <0..1> | .hdr gamma <g> | .hdr floatscene|smoothsky|dither <0|1>");
         }
 
@@ -193,9 +195,14 @@ public sealed class HdrModSystem : ModSystem
 
         return string.Format(
             CultureInfo.InvariantCulture,
-            "HDR {0}. paperwhite {1:0} nits, ui {11}, peak {2}, emissive {3:0.##}, highlight {4:0.##}, stars {9:0.##}, gamut {10:0.##}, gamma {5:0.##}, floatscene {6}, smoothsky {7}, dither {8}",
+            "HDR {0}. paperwhite {1}, ui {11}, peak {2}, emissive {3:0.##}, highlight {4:0.##}, stars {9:0.##}, gamut {10:0.##}, gamma {5:0.##}, floatscene {6}, smoothsky {7}, dither {8}",
             state,
-            config.PaperWhiteNits,
+            config.PaperWhiteNits > 0f
+                ? config.PaperWhiteNits.ToString("0", CultureInfo.InvariantCulture) + " nits"
+                : HdrRuntime.Presenter is null
+                    ? "from display (read when HDR is active)"
+                    : config.EffectivePaperWhiteNits.ToString("0", CultureInfo.InvariantCulture)
+                        + (config.DisplaySdrWhiteNits > 0f ? " nits (from display)" : " nits (default; the display reports no SDR white)"),
             config.PeakNits > 0f ? config.PeakNits.ToString("0", CultureInfo.InvariantCulture) + " nits" : "from display",
             config.EmissiveBoost,
             config.HighlightBoost,

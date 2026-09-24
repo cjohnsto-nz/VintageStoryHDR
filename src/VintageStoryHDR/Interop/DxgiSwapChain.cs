@@ -5,7 +5,8 @@ using System.Runtime.InteropServices;
 namespace VintageStoryHDR.Interop;
 
 /// <summary>What DXGI reports about the display the swapchain's window is on.</summary>
-internal readonly record struct DisplayInfo(bool HdrEnabled, float MinNits, float MaxNits, float MaxFullFrameNits);
+/// <param name="SdrWhiteNits">Where the system puts SDR white, or 0 if it does not say.</param>
+internal readonly record struct DisplayInfo(bool HdrEnabled, float MinNits, float MaxNits, float MaxFullFrameNits, float SdrWhiteNits = 0f);
 
 /// <summary>
 /// A D3D11 device, an scRGB flip-model swapchain on a window, and one RGBA16F texture of

@@ -3,7 +3,7 @@
   "modid": "hdr",
   "name": "Native HDR",
   "authors": [ "chrisunfocused" ],
-  "description": "Native HDR output for Vintage Story. Windows only.",
+  "description": "Native HDR output for Vintage Story. Windows, and Linux on native Wayland.",
   "version": "0.2.2",
   "side": "Client",
   "requiredOnClient": false,

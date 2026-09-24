@@ -1,5 +1,7 @@
 using System;
 using OpenTK.Graphics.OpenGL;
+using OpenTK.Windowing.Desktop;
+using OpenTK.Windowing.GraphicsLibraryFramework;
 using VintageStoryHDR.Interop;
 
 namespace VintageStoryHDR.Rendering;
@@ -17,14 +19,10 @@ namespace VintageStoryHDR.Rendering;
 /// Rec.709 have negative components.
 /// </item>
 /// <item>
-/// A <b>child window</b> covering the game window's client area carries the DXGI
-/// swapchain. The game window itself has already been presented to by GL, which rules it
-/// out as a flip-model target; the child is disabled, so all input still reaches the game.
-/// </item>
-/// <item>
 /// At the end of the frame the redirect texture is decoded to linear light, scaled to
-/// paper white, rolled off towards the display's peak and written, as scRGB, into a D3D11
-/// texture shared with GL. DXGI presents that.
+/// paper white, rolled off towards the display's peak and written into the texture of an
+/// <see cref="IHdrOutput"/>: as scRGB for DXGI on Windows, as PQ Rec.2020 (HDR10) for
+/// Vulkan on Wayland. The output presents it.
 /// </item>
 /// </list>
 ///
@@ -36,7 +34,7 @@ internal sealed class HdrPresenter : IDisposable
 out vec2 uv;
 void main() {
 	vec2 p = vec2(float((gl_VertexID << 1) & 2), float(gl_VertexID & 2));
-	// GL's row 0 is the bottom of the image, D3D's is the top.
+	// GL's row 0 is the bottom of the image; D3D's and Vulkan's is the top.
 	uv = vec2(p.x, 1.0 - p.y);
 	gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0);
 }";
@@ -47,6 +45,8 @@ uniform float gamma;
 uniform float paperWhite; // in scRGB units, 1.0 = 80 nits
 uniform float peak;       // in scRGB units
 uniform int ditherFrame;  // < 0 disables
+uniform int encodePq;     // 1: write PQ Rec.2020 (HDR10) instead of scRGB
+uniform float pqScale;    // encoded nits per displayed nit, for compositors that rescale PQ
 in vec2 uv;
 out vec4 outColor;
 
@@ -91,14 +91,25 @@ void main() {
 		lin *= rolled / m;
 	}
 
-	// The compositor quantises this to the display's 10-bit PQ signal without dithering.
-	// Do it here: triangular noise, one code value wide, in the domain it is quantised in.
+	// The display signal is 10-bit PQ, and the compositor quantises scRGB to it without
+	// dithering. Do it here: triangular noise, one code value wide, in the domain it is
+	// quantised in.
+	vec3 noise = vec3(0.0);
 	if (ditherFrame >= 0) {
 		vec3 seed = vec3(gl_FragCoord.xy, float(ditherFrame));
-		vec3 noise = vec3(
+		noise = vec3(
 			hash(seed) + hash(seed + 17.0),
 			hash(seed + 31.0) + hash(seed + 47.0),
 			hash(seed + 59.0) + hash(seed + 71.0)) - 1.0;
+	}
+
+	if (encodePq != 0) {
+		vec3 encodedPq = pqEncode(rec709To2020 * lin * pqScale * (80.0 / 10000.0)) + noise / 1023.0;
+		outColor = vec4(clamp(encodedPq, 0.0, 1.0), 1.0);
+		return;
+	}
+
+	if (ditherFrame >= 0) {
 		vec3 pq = pqEncode(rec709To2020 * lin * (80.0 / 10000.0)) + noise / 1023.0;
 		lin = rec2020To709 * pqDecode(pq) * (10000.0 / 80.0);
 	}
@@ -106,13 +117,10 @@ void main() {
 	outColor = vec4(lin, 1.0);
 }";
 
-    private readonly nint parentWindow;
-    private nint childWindow;
-    private DxgiSwapChain? swapChain;
-    private WglDxInterop? interop;
-    private nint sharedHandle;
+    private readonly Func<(int Width, int Height)> clientSize;
+    private readonly Func<int, int, IHdrOutput> createOutput;
+    private IHdrOutput? output;
 
-    private int sharedTexture;
     private int sharedFramebuffer;
     private int redirectTexture;
     private int redirectDepthStencil;
@@ -122,11 +130,14 @@ void main() {
     private int uniformPaperWhite;
     private int uniformPeak;
     private int uniformDitherFrame;
+    private int uniformEncodePq;
+    private int uniformPqScale;
     private int frameCounter;
 
-    private HdrPresenter(nint parentWindow)
+    private HdrPresenter(Func<(int Width, int Height)> clientSize, Func<int, int, IHdrOutput> createOutput)
     {
-        this.parentWindow = parentWindow;
+        this.clientSize = clientSize;
+        this.createOutput = createOutput;
     }
 
     /// <summary>The framebuffer object that stands in for framebuffer 0.</summary>
@@ -136,18 +147,38 @@ void main() {
 
     internal int Height { get; private set; }
 
-    internal DisplayInfo Display { get; private set; }
+    internal DisplayInfo Display => output?.Display ?? default;
 
-    internal bool TearingSupported => swapChain?.TearingSupported ?? false;
+    internal bool TearingSupported => output?.TearingSupported ?? false;
 
     /// <summary>
-    /// Builds the whole presentation path for <paramref name="parentWindow"/>. Throws
-    /// <see cref="HdrUnavailableException"/> and leaves nothing behind if any part of it
+    /// Builds the whole presentation path for the Win32 window <paramref name="parentWindow"/>.
+    /// Throws <see cref="HdrUnavailableException"/> and leaves nothing behind if any part of it
     /// is not available on this machine.
     /// </summary>
-    internal static HdrPresenter Create(nint parentWindow)
+    internal static HdrPresenter Create(nint parentWindow) =>
+        Create(
+            () => NativeMethods.GetClientRect(parentWindow, out NativeMethods.Rect rect)
+                ? (rect.Right - rect.Left, rect.Bottom - rect.Top)
+                : (0, 0),
+            (width, height) => DxgiOutput.Create(parentWindow, width, height));
+
+    /// <summary>As <see cref="Create(nint)"/>, for a game window running on GLFW's Wayland backend.</summary>
+    internal static unsafe HdrPresenter CreateWayland(NativeWindow window)
     {
-        HdrPresenter presenter = new(parentWindow);
+        Window* handle = window.WindowPtr;
+        return Create(
+            () =>
+            {
+                GLFW.GetFramebufferSize(handle, out int width, out int height);
+                return (width, height);
+            },
+            (width, height) => WaylandVulkanOutput.Create(window, width, height));
+    }
+
+    private static HdrPresenter Create(Func<(int Width, int Height)> clientSize, Func<int, int, IHdrOutput> createOutput)
+    {
+        HdrPresenter presenter = new(clientSize, createOutput);
         try
         {
             presenter.Initialise();
@@ -162,33 +193,13 @@ void main() {
 
     private void Initialise()
     {
-        (int width, int height) = ClientSize();
+        (int width, int height) = clientSize();
         if (width <= 0 || height <= 0)
         {
             throw new HdrUnavailableException("The game window has no client area (minimised?).");
         }
 
-        childWindow = NativeMethods.CreateWindowEx(
-            NativeMethods.WsExNoParentNotify,
-            "STATIC",
-            string.Empty,
-            NativeMethods.WsChild | NativeMethods.WsVisible | NativeMethods.WsDisabled,
-            0,
-            0,
-            width,
-            height,
-            parentWindow,
-            0,
-            0,
-            0);
-        if (childWindow == 0)
-        {
-            throw new HdrUnavailableException("Could not create the presentation window.");
-        }
-
-        swapChain = DxgiSwapChain.Create(childWindow, width, height);
-        Display = swapChain.QueryDisplay();
-        interop = new WglDxInterop(swapChain.Device);
+        output = createOutput(width, height);
 
         int previousTexture = GL.GetInteger(GetPName.TextureBinding2D);
         int previousFramebuffer = GL.GetInteger(GetPName.DrawFramebufferBinding);
@@ -200,6 +211,8 @@ void main() {
             uniformPaperWhite = GL.GetUniformLocation(program, "paperWhite");
             uniformPeak = GL.GetUniformLocation(program, "peak");
             uniformDitherFrame = GL.GetUniformLocation(program, "ditherFrame");
+            uniformEncodePq = GL.GetUniformLocation(program, "encodePq");
+            uniformPqScale = GL.GetUniformLocation(program, "pqScale");
             GL.ProgramUniform1(program, GL.GetUniformLocation(program, "source"), 0);
             vertexArray = GL.GenVertexArray();
 
@@ -227,7 +240,7 @@ void main() {
     /// </summary>
     internal bool SyncSize()
     {
-        (int width, int height) = ClientSize();
+        (int width, int height) = clientSize();
         if (width <= 0 || height <= 0)
         {
             return false;
@@ -243,21 +256,12 @@ void main() {
         int previousRenderbuffer = GL.GetInteger(GetPName.RenderbufferBinding);
         try
         {
-            // The interop registration pins the old D3D texture, and the swapchain cannot
-            // resize while anything still references its buffers.
-            interop!.Unregister(sharedHandle);
-            sharedHandle = 0;
-            GL.DeleteTexture(sharedTexture);
-            sharedTexture = 0;
-
-            _ = NativeMethods.SetWindowPos(childWindow, 0, 0, 0, width, height, NativeMethods.SwpNoZOrder | NativeMethods.SwpNoActivate);
-            swapChain!.Resize(width, height);
+            output!.Resize(width, height);
 
             Width = width;
             Height = height;
             AllocateRedirectTargets();
             AttachSharedTexture();
-            Display = swapChain.QueryDisplay();
         }
         finally
         {
@@ -270,12 +274,12 @@ void main() {
     }
 
     /// <summary>
-    /// Encodes the redirect framebuffer to scRGB and presents it. Replaces the GL buffer
+    /// Encodes the redirect framebuffer for the output and presents it. Replaces the GL buffer
     /// swap. Leaves the GL state it touched as it found it.
     /// </summary>
     internal void Present(HdrConfig config, bool vsync)
     {
-        if (sharedHandle == 0 || swapChain is null || interop is null)
+        if (output is null || output.Texture == 0)
         {
             return;
         }
@@ -283,8 +287,9 @@ void main() {
         // Encoded 1.0 in the redirect buffer is GUI white. The scene was already scaled
         // relative to that by the final shader -- if it is patched; if not, scene and GUI
         // cannot be told apart and both sit at the scene's level, as they always did.
-        float whiteNits = HdrRuntime.FinalShaderPatched ? config.EffectiveUiNits : config.PaperWhiteNits;
-        float brightestWhite = Math.Max(whiteNits, config.PaperWhiteNits);
+        config.DisplaySdrWhiteNits = Display.SdrWhiteNits;
+        float whiteNits = HdrRuntime.FinalShaderPatched ? config.EffectiveUiNits : config.EffectivePaperWhiteNits;
+        float brightestWhite = Math.Max(whiteNits, config.EffectivePaperWhiteNits);
 
         float peakNits = config.PeakNits > 0f ? config.PeakNits : Display.MaxNits;
         if (!(peakNits >= brightestWhite))
@@ -305,7 +310,7 @@ void main() {
         GL.ActiveTexture(TextureUnit.Texture0);
         int previousTexture = GL.GetInteger(GetPName.TextureBinding2D);
 
-        interop.Lock(sharedHandle);
+        output.BeginWrite();
         try
         {
             GL.BindFramebuffer(FramebufferTarget.Framebuffer, sharedFramebuffer);
@@ -322,6 +327,8 @@ void main() {
             GL.Uniform1(uniformPeak, peakNits / 80f);
             frameCounter = (frameCounter + 1) & 0xFF;
             GL.Uniform1(uniformDitherFrame, config.Dither ? frameCounter : -1);
+            GL.Uniform1(uniformEncodePq, output.EncodesPq ? 1 : 0);
+            GL.Uniform1(uniformPqScale, output.ContentScale);
             GL.BindTexture(TextureTarget.Texture2D, redirectTexture);
             GL.BindVertexArray(vertexArray);
             GL.DrawArrays(PrimitiveType.Triangles, 0, 3);
@@ -339,28 +346,16 @@ void main() {
             Restore(EnableCap.ScissorTest, scissorTest);
             Restore(EnableCap.StencilTest, stencilTest);
 
-            interop.Unlock(sharedHandle);
+            output.EndWrite();
         }
 
-        swapChain.Present(vsync);
+        output.Present(vsync, peakNits);
     }
 
     public void Dispose()
     {
-        bool haveContext = NativeMethods.WglGetCurrentContext() != 0;
-
-        if (interop is not null && haveContext)
+        if (GlContext.IsCurrent)
         {
-            interop.Unregister(sharedHandle);
-            sharedHandle = 0;
-            interop.Dispose();
-        }
-
-        interop = null;
-
-        if (haveContext)
-        {
-            DeleteIfSet(ref sharedTexture, GL.DeleteTexture);
             DeleteIfSet(ref redirectTexture, GL.DeleteTexture);
             DeleteIfSet(ref redirectDepthStencil, GL.DeleteRenderbuffer);
             DeleteIfSet(ref sharedFramebuffer, GL.DeleteFramebuffer);
@@ -371,20 +366,9 @@ void main() {
             DeleteIfSet(ref program, GL.DeleteProgram);
         }
 
-        swapChain?.Dispose();
-        swapChain = null;
-
-        if (childWindow != 0)
-        {
-            _ = NativeMethods.DestroyWindow(childWindow);
-            childWindow = 0;
-        }
+        output?.Dispose();
+        output = null;
     }
-
-    private (int Width, int Height) ClientSize() =>
-        NativeMethods.GetClientRect(parentWindow, out NativeMethods.Rect rect)
-            ? (rect.Right - rect.Left, rect.Bottom - rect.Top)
-            : (0, 0);
 
     private void AllocateRedirectTargets()
     {
@@ -406,21 +390,13 @@ void main() {
 
     private void AttachSharedTexture()
     {
-        sharedTexture = GL.GenTexture();
-        sharedHandle = interop!.RegisterTexture(swapChain!.SharedTexture, sharedTexture);
-
-        // The texture only has storage, as far as GL is concerned, while it is locked.
-        interop.Lock(sharedHandle);
-        try
+        IHdrOutput target = output!;
+        target.WithTexture(() =>
         {
             GL.BindFramebuffer(FramebufferTarget.Framebuffer, sharedFramebuffer);
-            GL.FramebufferTexture2D(FramebufferTarget.Framebuffer, FramebufferAttachment.ColorAttachment0, TextureTarget.Texture2D, sharedTexture, 0);
-            RequireComplete("shared D3D11");
-        }
-        finally
-        {
-            interop.Unlock(sharedHandle);
-        }
+            GL.FramebufferTexture2D(FramebufferTarget.Framebuffer, FramebufferAttachment.ColorAttachment0, TextureTarget.Texture2D, target.Texture, 0);
+            RequireComplete("output");
+        });
     }
 
     private static void RequireComplete(string name)

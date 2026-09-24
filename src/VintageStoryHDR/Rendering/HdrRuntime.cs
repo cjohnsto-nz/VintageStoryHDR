@@ -201,7 +201,7 @@ internal static class HdrRuntime
     internal static void Shutdown(List<FrameBufferRef>? frameBuffers)
     {
         Deactivate("Mod unloaded.");
-        if (NativeMethods.WglGetCurrentContext() != 0)
+        if (GlContext.IsCurrent)
         {
             GL.BindFramebuffer(FramebufferTarget.Framebuffer, 0);
             if (frameBuffers is not null)
@@ -225,26 +225,30 @@ internal static class HdrRuntime
         HdrPresenter? created = null;
         try
         {
-            nint hwnd = WindowHandle(platform.window);
-            created = HdrPresenter.Create(hwnd);
+            created = OperatingSystem.IsWindows()
+                ? HdrPresenter.Create(WindowHandle(platform.window))
+                : HdrPresenter.CreateWayland(platform.window);
 
             if (!created.Display.HdrEnabled && !Config.ForceOnSdrDisplay)
             {
                 throw new HdrUnavailableException(
-                    "Windows reports this display as SDR. Turn on \"Use HDR\" in Windows display settings, then type .hdr on.");
+                    OperatingSystem.IsWindows()
+                        ? "Windows reports this display as SDR. Turn on \"Use HDR\" in Windows display settings, then type .hdr on."
+                        : WaylandVulkanOutput.SdrDisplayMessage);
             }
 
             presenter = created;
             created = null;
             InactiveReason = null;
             Log?.Notification(
-                "HDR presentation active: {0}x{1} scRGB, display {2} (peak {3:0} nits, full-frame {4:0} nits), tearing {5}.",
+                "HDR presentation active: {0}x{1} {6}, display {2} (peak {3:0} nits, full-frame {4:0} nits), tearing {5}.",
                 presenter.Width,
                 presenter.Height,
                 presenter.Display.HdrEnabled ? "HDR" : "SDR (forced)",
                 presenter.Display.MaxNits,
                 presenter.Display.MaxFullFrameNits,
-                presenter.TearingSupported ? "supported" : "not supported");
+                presenter.TearingSupported ? "supported" : "not supported",
+                OperatingSystem.IsWindows() ? "scRGB via DXGI" : "HDR10 via Vulkan on a Wayland subsurface");
         }
         catch (Exception e) when (e is HdrUnavailableException or DllNotFoundException or EntryPointNotFoundException)
         {
@@ -273,8 +277,9 @@ internal static class HdrRuntime
         InactiveReason = reason;
         presenter.Dispose();
         presenter = null;
+        Config.DisplaySdrWhiteNits = 0f;
 
-        if (NativeMethods.WglGetCurrentContext() != 0)
+        if (GlContext.IsCurrent)
         {
             FinalShaderUniforms.Disable();
         }

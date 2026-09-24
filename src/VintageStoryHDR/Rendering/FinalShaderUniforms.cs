@@ -39,7 +39,7 @@ internal static class FinalShaderUniforms
         GL.ProgramUniform1(cachedProgram, locationHighlightBoost, config.HighlightBoost);
         GL.ProgramUniform1(cachedProgram, locationGamma, config.SdrGamma);
         GL.ProgramUniform1(cachedProgram, locationGamut, config.GamutExpansion);
-        GL.ProgramUniform1(cachedProgram, locationSceneScale, config.PaperWhiteNits / config.EffectiveUiNits);
+        GL.ProgramUniform1(cachedProgram, locationSceneScale, config.EffectivePaperWhiteNits / config.EffectiveUiNits);
     }
 
     /// <summary>Puts the final shader back on its vanilla path. The value lives in the program object, so it has to be cleared explicitly.</summary>
